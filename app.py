@@ -89,8 +89,11 @@ if not st.session_state.features_ready:
     with st.spinner("⚙️ Processing raw data (one-time)…"):
         raw_df = load_raw_file(uploaded_file)
 
-        start = time.time()
+        # 🔍 DEBUG (ADD HERE)
+        st.write("Raw columns:", raw_df.columns.tolist())
+
         df = extract_features(raw_df)
+
         st.write(f"⏱ Feature extraction time: {round(time.time()-start, 2)} sec")
 
         # Safety check
@@ -205,3 +208,4 @@ if st.sidebar.button("⬇️ Download Excel"):
         "icc_decisions.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
