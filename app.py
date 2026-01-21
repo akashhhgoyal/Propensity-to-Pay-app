@@ -1,9 +1,11 @@
+from feature_engineering import extract_features
 import streamlit as st
 import pandas as pd
 import joblib
 import os
 import matplotlib.pyplot as plt
 import time
+from io import BytesIO
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -39,10 +41,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs", "tables")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 # --------------------------------------------------
-# SESSION STATE (CRITICAL FIX)
+# SESSION STATE
 # --------------------------------------------------
 if "batch_file_ready" not in st.session_state:
     st.session_state.batch_file_ready = False
@@ -55,17 +55,13 @@ if "batch_file_path" not in st.session_state:
 # --------------------------------------------------
 @st.cache_resource
 def load_model():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(base_dir, "models", "final_model.pkl")
-
+    model_path = os.path.join(BASE_DIR, "models", "final_model.pkl")
     if not os.path.exists(model_path):
         st.error(f"Model file not found at: {model_path}")
         st.stop()
-
     return joblib.load(model_path)
 
 model = load_model()
-
 
 # --------------------------------------------------
 # VISUAL HELPERS
@@ -90,7 +86,6 @@ def plot_distribution_pie(data, title):
     st.pyplot(fig)
     plt.close(fig)
 
-
 def plot_single_decision(decision_label):
     color = DECISION_COLORS[1] if decision_label == "ICC RECOVERABLE" else DECISION_COLORS[0]
     fig, ax = plt.subplots(figsize=(1.8, 1.8))
@@ -106,35 +101,45 @@ def plot_single_decision(decision_label):
 st.sidebar.header("📂 Upload Monthly Loan File")
 
 uploaded_file = st.sidebar.file_uploader(
-    "Upload Processed Monthly File (Excel or CSV)",
+    "Upload Raw Monthly File (Excel or CSV)",
     type=["csv", "xlsx"]
 )
 
 if uploaded_file is None:
-    st.info("👈 Upload a processed monthly file to begin")
+    st.info("👈 Upload a monthly file to begin")
     st.stop()
 
 # --------------------------------------------------
-# LOAD + PREDICT
+# LOAD + FEATURE EXTRACTION + PREDICT  ✅ FIXED
 # --------------------------------------------------
+# Load RAW file
 if uploaded_file.name.endswith(".csv"):
-    df = pd.read_csv(uploaded_file)
+    raw_df = pd.read_csv(uploaded_file)
 else:
-    df = pd.read_excel(uploaded_file)
+    raw_df = pd.read_excel(uploaded_file)
 
+# Feature Extraction
+try:
+    df = extract_features(raw_df)
+except Exception as e:
+    st.error(f"Feature extraction failed: {e}")
+    st.stop()
+
+# Safety Check
 required_cols = set(FEATURE_COLS + [LOAN_ID_COL])
 missing = required_cols - set(df.columns)
 if missing:
-    st.error(f"Missing required columns: {missing}")
+    st.error(f"Missing required columns after feature extraction: {missing}")
     st.stop()
 
+# Prediction
 X = df[FEATURE_COLS].apply(pd.to_numeric, errors="coerce").fillna(0)
 
 df["icc_recovery_probability"] = model.predict_proba(X)[:, 1]
 df["decision"] = (df["icc_recovery_probability"] >= THRESHOLD).astype(int)
 df["decision_label"] = df["decision"].map(DECISION_LABELS)
 
-st.success(f"Loaded and processed {len(df)} loans")
+st.success(f"Loaded, feature-engineered and processed {len(df)} loans")
 
 # --------------------------------------------------
 # SIDEBAR — SELECTION MODE
@@ -181,22 +186,15 @@ if selection_mode == "Drilldown by Decision":
     paginated_table(df[df["decision_label"] == "REFER OUT"], "refer_page")
 
 # --------------------------------------------------
-# SINGLE LOAN SEARCH
+# SINGLE / BULK SEARCH (UNCHANGED)
 # --------------------------------------------------
 elif selection_mode == "Single Loan Search":
     loan_input = st.sidebar.text_input("Enter Loan Number (partial allowed)")
-
     if loan_input.strip():
-        customer = df[
-            df[LOAN_ID_COL]
-            .astype(str)
-            .str.contains(loan_input.strip(), case=False, na=False)
-        ]
-
+        customer = df[df[LOAN_ID_COL].astype(str).str.contains(loan_input, case=False, na=False)]
         if customer.empty:
             st.error("No matching loan found")
             st.stop()
-
         row = customer.iloc[0]
 
         c1, c2 = st.columns([1.2, 2.8])
@@ -205,71 +203,29 @@ elif selection_mode == "Single Loan Search":
         with c2:
             prob = row["icc_recovery_probability"] * 100
             emoji = "🔥" if prob >= 70 else "⚠️" if prob >= 50 else "❄️"
-
             st.metric(
-                label="📊 ICC Recovery Probability",
-                value=f"{prob:.1f}%",
-                delta=f"{emoji} {'High' if prob>=70 else 'Medium' if prob>=50 else 'Low'} Confidence"
+                "📊 ICC Recovery Probability",
+                f"{prob:.1f}%",
+                f"{emoji} {'High' if prob>=70 else 'Medium' if prob>=50 else 'Low'} Confidence"
             )
-
         st.subheader("📄 Loan Details")
         st.dataframe(customer)
 
-# --------------------------------------------------
-# BULK LOAN SEARCH
-# --------------------------------------------------
 else:
-    loan_input = st.sidebar.text_area(
-        "Enter Loan Numbers (comma / newline separated, partial allowed)"
-    )
-
+    loan_input = st.sidebar.text_area("Enter Loan Numbers (comma / newline separated)")
     if loan_input.strip():
-        loan_list = [
-            x.strip()
-            for x in loan_input.replace(",", "\n").split("\n")
-            if x.strip()
-        ]
-
-        pattern = "|".join(loan_list)
-
-        customer_df = df[
-            df[LOAN_ID_COL]
-            .astype(str)
-            .str.contains(pattern, case=False, na=False)
-        ]
-
+        pattern = "|".join(x.strip() for x in loan_input.replace(",", "\n").split("\n") if x.strip())
+        customer_df = df[df[LOAN_ID_COL].astype(str).str.contains(pattern, case=False, na=False)]
         if customer_df.empty:
             st.error("No matching loans found")
             st.stop()
-
-        if len(customer_df) == 1:
-            row = customer_df.iloc[0]
-            c1, c2 = st.columns([1.2, 2.8])
-            with c1:
-                plot_single_decision(row["decision_label"])
-            with c2:
-                prob = row["icc_recovery_probability"] * 100
-                emoji = "🔥" if prob >= 70 else "⚠️" if prob >= 50 else "❄️"
-
-                st.metric(
-                    label="📊 ICC Recovery Probability",
-                    value=f"{prob:.1f}%",
-                    delta=f"{emoji} {'High' if prob>=70 else 'Medium' if prob>=50 else 'Low'} Confidence"
-                )
-        else:
-            plot_distribution_pie(customer_df, "Selected Loans Decision Split")
-
+        plot_distribution_pie(customer_df, "Selected Loans Decision Split")
         st.subheader("📄 Selected Loan Details")
         st.dataframe(customer_df)
 
 # --------------------------------------------------
-# EXPORT (CLOUD-SAFE | NO CRASH)
+# EXPORT
 # --------------------------------------------------
-from io import BytesIO
-
-st.sidebar.markdown("---")
-st.sidebar.header("📤 Export Decisions")
-
 @st.cache_data(show_spinner=False)
 def generate_excel(dataframe):
     buffer = BytesIO()
@@ -278,49 +234,14 @@ def generate_excel(dataframe):
     buffer.seek(0)
     return buffer
 
+st.sidebar.markdown("---")
+st.sidebar.header("📤 Export Decisions")
+
 if st.sidebar.button("Generate Full Portfolio File"):
-
-    progress_bar = st.sidebar.progress(0)
-    status_text = st.sidebar.empty()
-    eta_text = st.sidebar.empty()
-
-    start_time = time.time()
-
-    def update_progress(pct, message):
-        elapsed = time.time() - start_time
-        eta = int((elapsed / pct) * (100 - pct)) if pct > 0 else 0
-
-        progress_bar.progress(pct)
-        status_text.markdown(f"**{message} ({pct}%)**")
-        eta_text.markdown(f"⏳ ETA: ~{eta} sec" if pct < 100 else " ")
-
-    # ---- Smooth animation: 0 → 30
-    for i in range(1, 31):
-        update_progress(i, "🔄 Initializing export")
-        time.sleep(0.02)
-
-    # ---- Smooth animation: 30 → 70
-    for i in range(31, 71):
-        update_progress(i, "📊 Processing loan data")
-        time.sleep(0.02)
-
-    # ---- Actual heavy work
-    update_progress(71, "📝 Writing Excel file")
     excel_file = generate_excel(df)
-
-    # ---- Smooth animation: 71 → 99
-    for i in range(72, 100):
-        update_progress(i, "📝 Finalizing file")
-        time.sleep(0.02)
-
-    # ---- Completion (GREEN BAR)
-    progress_bar.progress(100)
-    status_text.markdown("### 🎉 File ready (100%)")
-    eta_text.empty()
-
     st.sidebar.download_button(
-        label="⬇️ Download Excel",
-        data=excel_file,
-        file_name="icc_decisions_full_portfolio.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "⬇️ Download Excel",
+        excel_file,
+        "icc_decisions_full_portfolio.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
